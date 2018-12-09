@@ -1,0 +1,100 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+from __future__ import print_function
+
+import sys
+import tempfile
+import re
+import socket
+import struct
+import subprocess as sp
+
+def cidr_range(cidr):
+    net, mask = cidr.strip().split('/')
+    nmask = 0xffffffff >> (32 - int(mask)) << (32 - int(mask))
+    net = int(socket.inet_aton(net).encode('hex'), 16)
+    return [socket.inet_ntoa(struct.pack(">I", i)) for i in
+            range(net & nmask, net | (~nmask & 0xFFFFFFFF))]
+
+def test_cmd(cmd):
+    try:
+        sp.Popen([cmd.split(' ')[0]], stdout=sp.PIPE, stderr=sp.PIPE)
+        return True
+    except sp.CalledProcessError:
+        return True
+    except OSError:
+        return False
+
+if __name__ == '__main__':
+
+    UNBUFFER_CMDS = ['stdbuf -i0 -o0 -e0', 'gstdbuf -i0 -o0 -e0']
+
+    if len(sys.argv) < 3 or not sys.argv[2].startswith('AS'):
+        print('usage: {} <key fingerprint> <AS number>'.format(__file__))
+        sys.exit(1)
+    else:
+        key_fingerprint = sys.argv[1].strip()
+        network_number = sys.argv[2].strip()
+
+    # Check for ssh-keyscan and whois
+    for cmd in ['ssh-keyscan', 'whois']:
+        if not test_cmd(cmd):
+            print('no "{}" in $PATH. Exiting.'.format(cmd))
+            sys.exit(1)
+
+    # Check whether any of the predefined unbuffer cmds
+    # are found in $PATH. Inform user.
+    unbuf_cmd = None
+    for cmd in UNBUFFER_CMDS:
+        if test_cmd(cmd):
+            unbuf_cmd = cmd
+    if unbuf_cmd:
+        print('Using "{}" to unbuffer subprocess stdout'.format(unbuf_cmd))
+    else:
+        print('No unbuffer cmd in $PATH. Subprocess stdout will be buffered')
+        unbuf_cmd = ''
+
+    # Get WHOIS data from radb.net and parse network segments
+    whois = sp.Popen(['whois', '-h', 'whois.radb.net',
+       '--', '-i origin ' + network_number],
+       stdout=sp.PIPE, stderr=sp.STDOUT,
+       universal_newlines=True)
+    whois_output = whois.communicate()[0]
+
+    if whois.returncode != 0:
+        print('Non-zero exit code for "whois". Exiting.')
+        sys.exit(1)
+
+    ranges = []
+    ip_list = []
+    for line in whois_output.split('\n'):
+        if re.match(r'^route:', line):
+            ranges.append(re.split(r'\s+', line)[-1])
+
+    tmpfile = tempfile.NamedTemporaryFile()
+
+    if len(ranges) > 0:
+        print('Found {} ranges for {}'.format(len(ranges), network_number))
+        for r in ranges:
+            ip_list += cidr_range(r)
+        for line in ip_list:
+            tmpfile.write(line + '\n')
+        tmpfile.flush()
+        print('Wrote {} IPs to scanfile'.format(len(ip_list)))
+    else:
+        print('No ranges.')
+
+    cmd = unbuf_cmd.split(' ') + \
+        'ssh-keyscan -f {} -T 5'.format(tmpfile.name).split(' ')
+
+    ret = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE,
+        universal_newlines=True)
+
+    for line in iter(ret.stdout.readline, ''):
+        print(line.strip()[:120])
+        if key_fingerprint in line:
+            print('FOUND', line.strip()[:120])
+            sys.exit(0)
+
+    sys.exit(1)
