@@ -8,7 +8,17 @@ import tempfile
 import re
 import socket
 import struct
+import getopt
 import subprocess as sp
+
+usage = '''usage: {} [options] <hostkey fingerprint> <AS number>
+Scan AS address space for SSH server whose hostkey matches
+a specific fingerprint.
+
+Options:
+    -p, --port    port to scan
+'''.format(__file__)
+
 
 def cidr_range(cidr):
     net, mask = cidr.strip().split('/')
@@ -28,14 +38,25 @@ def test_cmd(cmd):
 
 if __name__ == '__main__':
 
-    UNBUFFER_CMDS = ['stdbuf -i0 -o0 -e0', 'gstdbuf -i0 -o0 -e0']
-
-    if len(sys.argv) < 3 or not sys.argv[2].startswith('AS'):
-        print('usage: {} <key fingerprint> <AS number>'.format(__file__))
+    try:
+        optlist, args = getopt.getopt(sys.argv[1:], 'hp:', ['help', 'port='])
+        if len(args) != 2:
+            raise getopt.GetoptError('wrong number of arguments')
+    except getopt.GetoptError as e:
+        sys.stderr.write(str(e) + '\n')
+        sys.stderr.write(usage + '\n')
         sys.exit(1)
-    else:
-        key_fingerprint = sys.argv[1].strip()
-        network_number = sys.argv[2].strip()
+    ssh_port = 22
+    for o, a in optlist:
+        if o in ['-h', '--help']:
+            sys.stderr.write(usage + '\n')
+            sys.exit(1)
+        if o in ['-p', '--port']:
+            ssh_port = a
+    key_fingerprint = args[0].strip()
+    network_number = args[1].strip()
+
+    UNBUFFER_CMDS = ['stdbuf -i0 -o0 -e0', 'gstdbuf -i0 -o0 -e0']
 
     # Check for ssh-keyscan and whois
     for cmd in ['ssh-keyscan', 'whois']:
@@ -86,7 +107,7 @@ if __name__ == '__main__':
         print('No ranges.')
 
     cmd = unbuf_cmd.split(' ') + \
-        'ssh-keyscan -f {} -T 5'.format(tmpfile.name).split(' ')
+        'ssh-keyscan -f {} -p {} -T 5'.format(tmpfile.name, ssh_port).split(' ')
 
     ret = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE,
         universal_newlines=True)
