@@ -10,22 +10,372 @@ import socket
 import struct
 import getopt
 import subprocess as sp
+import os
+import time
+import select
+import base64
+import resource
+import math
+from collections import OrderedDict
 
-usage = '''usage: {} [options] <hostkey fingerprint> <AS number>
-Scan AS address space for SSH server whose hostkey matches
-a specific fingerprint.
+USAGE = '''usage: {f} [-e] [-p port] [-k key_algo] fingerprint as_number
+
+Scan ISP's IPv4 address space for an SSH server whose hostkey matches
+a given host key fingerprint.
 
 Options:
-    -p, --port    port to scan
-'''.format(__file__)
+    -e, --exec-ks    use ssh-keyscan. sshds are still searched with {f}
+                     but actual key fetching is delegated to ssh-keyscan,
+                     which does it more realiably than the simple key exchange
+                     logic used in {f} itself. another benefit is
+                     support for wider range of kex algorithms and SSH
+                     protocol versions.
+    -p, --port=      port to scan (default: 22)
+    -k, --key-algo=  host key algorithm (no effect with -e, --exec-ks).
+                     allowed values:
+                         "ecdsa" for ecdsa-sha2-nistp256 (default)
+                         "ed25519" for ssh-ed25519
+                         "rsa" for ssh-rsa
+
+Arguments:
+    fingerprint    complete or partial host key fingerprint
+    as_number      ASN for the ISP whose network the sshd is on
+'''.format(f=__file__)
 
 
-def cidr_range(cidr):
-    net, mask = cidr.strip().split('/')
-    nmask = 0xffffffff >> (32 - int(mask)) << (32 - int(mask))
+ISATTY = os.isatty(sys.stdout.fileno())
+IDENTITFICATION_STRING = 'SSH-2.0-OpenSSH-keyscan'
+SCAN_BATCH_SIZE = resource.getrlimit(resource.RLIMIT_NOFILE)[0] - 10
+MIN_ROUTING_PREFIX_LENGTH = 8
+SSH_COOKIE_SIZE = 16
+SCRIPT = os.path.basename(__file__)
+
+SSH_NUMBERS = {
+
+    # See rfc4253: sections 7.1, 12
+    'SSH_MSG_KEXINIT': 20,
+
+    # See rfc5656: section 7
+    'SSH_MSG_KEX_X_REPLY': 31,
+}
+
+SUPPORTED_KEY_ALGOS = {
+    'ecdsa': 'ecdsa-sha2-nistp256',
+    'ed25519': 'ssh-ed25519',
+    'rsa': 'ssh-rsa',
+}
+
+KEX_PUBKEYS = {
+
+    'curve25519-sha256': '' \
+        '\x1e\x00\x00\x00\x20\xdd\xd8\x2b\xa3\x03\x51\x82\xc1\x5d\xa0\xf0' \
+        '\xfe\x8a\x89\x2e\x0d\x0b\xb8\x02\x89\x30\x03\xef\xc9\xa5\xc2\x40' \
+        '\x20\x9e\x57\xc3\x1b',
+
+    'ecdh-sha2-nistp256': '' \
+        '\x1e\x00\x00\x00\x20\x04\x33\xc5\xa9\x97\xf8\x6f\x02\xbc\xad\xb8' \
+        '\xd9\x95\xdb\xe5\x7c\xaa\x72\x96\xf1\x71\x3b\xab\x08\x76\x46\xd4' \
+        '\xab\xb8\x48\x82\x4d\x40\x09\x11\x18\x3a\x89\x3c\x78\x15\xd2\x48' \
+        '\x82\x48\x6f\x21\x1b\xe1\xcb\xb6\xaf\xe0\xdb\xe4\xaf\xfd\x68\xfb' \
+        '\x57\x5b\xe8\x5c\x74\xa4',
+
+}
+
+pretend_kex_support = OrderedDict((
+
+    ('kex_algorithms', [
+        'curve25519-sha256',
+        'curve25519-sha256@libssh.org',
+        'ecdh-sha2-nistp256',
+    ]),
+
+    ('server_host_key_algorithms', []),
+
+    ('encryption_algorithms_client_to_server', [
+        'chacha20-poly1305@openssh.com',
+        'aes128-ctr',
+        'aes192-ctr',
+        'aes256-ctr',
+        'aes128-gcm@openssh.com',
+        'aes256-gcm@openssh.com',
+    ]),
+
+    ('encryption_algorithms_server_to_client', [
+        'chacha20-poly1305@openssh.com',
+        'aes128-ctr',
+        'aes192-ctr',
+        'aes256-ctr',
+        'aes128-gcm@openssh.com',
+        'aes256-gcm@openssh.com',
+    ]),
+
+    ('mac_algorithms_client_to_server', [
+        'umac-64-etm@openssh.com',
+        'umac-128-etm@openssh.com',
+        'hmac-sha2-256-etm@openssh.com',
+        'hmac-sha2-512-etm@openssh.com',
+        'hmac-sha1-etm@openssh.com',
+        'umac-64@openssh.com',
+        'umac-128@openssh.com',
+        'hmac-sha2-256',
+        'hmac-sha2-512',
+        'hmac-sha1',
+    ]),
+
+    ('mac_algorithms_server_to_client', [
+        'umac-64-etm@openssh.com',
+        'umac-128-etm@openssh.com',
+        'hmac-sha2-256-etm@openssh.com',
+        'hmac-sha2-512-etm@openssh.com',
+        'hmac-sha1-etm@openssh.com',
+        'umac-64@openssh.com',
+        'umac-128@openssh.com',
+        'hmac-sha2-256',
+        'hmac-sha2-512',
+        'hmac-sha1',
+    ]),
+
+    ('compression_algorithms_client_to_server', ['none', 'zlib@openssh.com']),
+
+    ('compression_algorithms_server_to_client', ['none', 'zlib@openssh.com']),
+
+    ('languages_client_to_server', []),
+
+    ('languages_server_to_client', []),
+
+))
+
+class ScannerSocket(socket.socket):
+
+    def __init__(self, store, *args, **kwargs):
+        super(ScannerSocket, self).__init__(*args, **kwargs)
+        self._store = store
+        self.created = time.time()
+        self.setblocking(0)
+        self.remote_addr = ''
+        self.remote_port = 0
+
+    def destroy(self):
+        self._store.remove(self)
+        self.close()
+
+    def connect(self, host, port):
+        self.remote_addr = host
+        self.remote_port = port
+        return super(ScannerSocket, self).connect_ex((host, port))
+
+class PortScanner(object):
+
+    def __init__(self, hosts, port=22, hostkey_algorithm=None, timeout=5):
+        self.hosts = hosts
+        self.port = port
+        self.active = []
+        self.sockets = []
+        self.timeout_seconds = timeout
+        self.found = False
+        self.hostkey_algorithm = hostkey_algorithm
+
+    def __enter__(self):
+        for i in range(len(self.hosts)):
+            s = ScannerSocket(
+                self.sockets, socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(self.hosts[i], self.port)
+            self.sockets.append(s)
+        return self
+
+    def __exit__(self, *args):
+        socket_count = len(self.sockets)
+        for s in range(socket_count):
+            self.sockets[socket_count - 1 - s].destroy()
+
+    def timeout(self):
+        for s in self.sockets:
+            if time.time() - s.created > self.timeout_seconds:
+                s.destroy()
+
+    def mark_as_open(self, socket):
+        self.active.append(socket.remote_addr)
+
+    def get_scan_results(self):
+        return [i for i in self.active]
+
+def _stdout(output_text, warning=False, overwrite=False):
+    s = '-' if warning else '+'
+    if ISATTY:
+        if overwrite:
+            output = '\x1b8[{}] {}\n'.format(s, output_text)
+        else:
+            output = '[{}] {}\n\x1b7'.format(s, output_text)
+
+    else:
+        output = '[{}] {}\n'.format(s, output_text)
+    sys.stdout.write(output)
+    sys.stdout.flush()
+
+def _stderr(*args, **kwargs):
+    _exit = kwargs.get('exit', 0)
+    for arg in args:
+        sys.stderr.write(arg + '\n')
+    sys.stderr.flush()
+    if _exit:
+        sys.exit(_exit)
+
+def unpack(data, len_only=False):
+    plen, padlen, rest = struct.unpack('>IB{}s'.format(
+        len(data) - 4 - 1), data)
+    if len_only:
+        return plen + 4
+    payload, _randpad = struct.unpack('>{}s{}s'.format(
+        plen - padlen - 1, padlen), rest[:plen - 1])
+    return payload
+
+def unpack_kexinit(payload):
+    namelists = {}
+    _cookie, rest = struct.unpack(
+        '>{}s{}s'.format(SSH_COOKIE_SIZE, len(payload) - SSH_COOKIE_SIZE),
+        payload)
+    for nl_key in pretend_kex_support.keys():
+        nl_len, rest = struct.unpack('>I{}s'.format(len(rest) - 4), rest)
+        namelist, rest = struct.unpack(
+            '>{}s{}s'.format(nl_len, len(rest) - nl_len),
+            rest)
+        namelists[nl_key] = namelist.split(',') if namelist else []
+    kexfollows, _reserved = struct.unpack('>?I', rest)
+    return namelists, kexfollows
+
+def unpack_host_key(payload):
+    keylen, rest = struct.unpack('>I{}s'.format(len(payload) - 4), payload)
+    key = struct.unpack('>{}s'.format(keylen), rest[:keylen])[0]
+    return base64.b64encode(key)
+
+def pack(payload):
+    padlen = 4
+    while (4 + 1 + len(payload) + padlen) % 8:
+        padlen += 1
+    # padding_length + payload size + padding size
+    packet = struct.pack('>I', 1 + len(payload) + padlen)
+    packet += struct.pack('>B', padlen)
+    packet += struct.pack('>{}s'.format(len(payload)), payload)
+    packet += struct.pack('>{}s'.format(padlen), os.urandom(padlen))
+    return packet
+
+def pack_kexinit(hostkey_algorithm):
+    pretend_kex_support['server_host_key_algorithms'].append(hostkey_algorithm)
+    payload = struct.pack('>B', 20)
+    payload += os.urandom(SSH_COOKIE_SIZE)
+    for namelist in pretend_kex_support.keys():
+        namelist_str = ','.join(pretend_kex_support[namelist])
+        payload += struct.pack(
+            '>I{}s'.format(len(namelist_str)),
+            len(namelist_str), namelist_str)
+    # KEX follows, and reserved
+    payload += struct.pack('>?I', False, 0)
+    return payload
+
+def parse_cidr_range(cidr):
+    net, rprefix_bitlength = cidr.strip().split('/')
+
     net = int(socket.inet_aton(net).encode('hex'), 16)
-    return [socket.inet_ntoa(struct.pack(">I", i)) for i in
-            range(net & nmask, net | (~nmask & 0xFFFFFFFF))]
+    rprefix_bitlength = int(rprefix_bitlength)
+
+    if rprefix_bitlength < MIN_ROUTING_PREFIX_LENGTH:
+        raise ValueError(
+            'CIDR /{} is less that MIN_ROUTING_PREFIX_LENGTH {}'.format(
+                rprefix_bitlength, MIN_ROUTING_PREFIX_LENGTH))
+
+    mask = ~(0xFFFFFFFF >> rprefix_bitlength)
+    addr_min = net & mask
+    addr_max = addr_min | ~mask
+
+    return (
+
+        # Start address in octets
+        socket.inet_ntoa(struct.pack('>I', addr_min)),
+
+        # End address in octets
+        socket.inet_ntoa(struct.pack('>I', addr_max)),
+
+        # Whole range
+        [socket.inet_ntoa(struct.pack('>I', i)) \
+            for i in range(addr_min, addr_max + 1)],
+    )
+
+def create_hosts_list(ans):
+
+    hosts = []
+    ans_addr_blocks = extract_addr_blocks(whois(ans)) or []
+
+    _stdout(
+        'Found {} IP blocks for {}'.format(len(ans_addr_blocks), ans),
+        not ans_addr_blocks)
+
+    for ip_range in ans_addr_blocks:
+        _addr_min, _addr_max, _hosts = parse_cidr_range(ip_range)
+        hosts += _hosts
+
+    return hosts
+
+def check_kex_init(payload, rsocket, hostkey_algorithm):
+
+    namelists, _kexfollows = unpack_kexinit(payload[1:])
+    remote_addr = rsocket.getpeername()[0]
+
+    if hostkey_algorithm not in namelists.get('server_host_key_algorithms'):
+        _stdout('{} lacks support for our chosen host key algorithm' \
+            ' and will be ignored'.format(remote_addr), True)
+        return False
+
+    for kex_algorithm in pretend_kex_support['kex_algorithms']:
+        if kex_algorithm in KEX_PUBKEYS:
+            # Send EEC kex init
+            rsocket.sendall(pack(KEX_PUBKEYS[kex_algorithm]))
+            return True
+
+    _stdout(
+        '{} lacks support for any of the key exchange methods {} supports' \
+            ' ({}). This host will be ignored'.format(
+                remote_addr, SCRIPT, ', '.join(KEX_PUBKEYS.keys())),
+        True)
+
+    return False
+
+def process_recv(data, rsocket, hostkey_algorithm):
+
+    keep_socket = False
+    server_host_key = ''
+
+    if data.startswith('SSH-'):
+
+        # Abort unless protoversion >= 2.0
+        if not data.startswith('SSH-2'):
+            return keep_socket, server_host_key
+
+        # Send our identification string followed by key exchange init
+        rsocket.sendall(IDENTITFICATION_STRING + '\r\n')
+        rsocket.sendall(pack(pack_kexinit(hostkey_algorithm)))
+
+        _server_identity, kexinit_data = data.split('\r\n', 1)
+
+        if kexinit_data:
+            return process_recv(kexinit_data, rsocket, hostkey_algorithm)
+
+    else:
+
+        # Anything after the identification string should adhere to the
+        # binary packet protocol
+        payload = unpack(data)
+
+        # First byte should signal the packet type, at least during
+        # algorithm negotiation
+        msgcode = struct.unpack('>B', payload[0])[0]
+
+        if msgcode == SSH_NUMBERS['SSH_MSG_KEXINIT']:
+            keep_socket = check_kex_init(payload, rsocket, hostkey_algorithm)
+        elif msgcode == SSH_NUMBERS['SSH_MSG_KEX_X_REPLY']:
+            server_host_key = unpack_host_key(payload[1:])
+
+    return keep_socket, server_host_key
+
 
 def test_cmd(cmd):
     try:
@@ -36,86 +386,202 @@ def test_cmd(cmd):
     except OSError:
         return False
 
-if __name__ == '__main__':
+def show_progress(last, ips, scans):
+    now = time.time()
+    if now - last < 5:
+        return last
+    sys.stdout.write('\x1b[2K\x1b[50D{}/{}'.format(len(scans), len(ips)))
+    return now
+
+def extract_addr_blocks(whois_response):
+    return [m.groups()[0] for m in \
+        re.finditer(r'^\s*route:\s+([0-9].*)\s*$', whois_response, re.M)]
+
+def whois(as_number):
+    with open('whois_response', 'rb') as f:
+        return f.read()
+    response = ''
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.connect(('whois.radb.net', 43))
+        # s.connect(('217.70.185.84', 43))
+        s.send('-i origin {}\r\n'.format(as_number))
+        while True:
+            chunk = s.recv(1024)
+            if not chunk:
+                break
+            response += chunk
+        return response
+    except (socket.error, socket.timeout):
+        return None
+
+def scan_host_keys(hosts_fpath, port, fingerprint_partial, timeout=10):
+    devnull = open(os.devnull, 'wb')
+    try:
+        exec_output = sp.check_output([
+            'ssh-keyscan',
+            '-f', hosts_fpath,
+            '-p', str(port),
+            '-T', str(timeout)], stderr=devnull)
+    except sp.CalledProcessError:
+        exec_output = None
+    finally:
+        devnull.close()
+    if exec_output:
+        for line in exec_output.strip().split('\n'):
+            if fingerprint_partial in line:
+                return re.split(r'\s+', line)[0]
+    return None
+
+def _handle_kexinit_msg(
+        payload, hostkey_algorithm, remove, sock,
+        remote_addr, no_hk, no_kex):
+
+    namelists, _kexfollows = unpack_kexinit(payload[1:])
+
+    if hostkey_algorithm not in namelists.get('server_host_key_algorithms'):
+        no_hk.append(remote_addr)
+        remove(sock)
+        return
+
+    kexa = None
+    for _kexa in pretend_kex_support['kex_algorithms']:
+        if _kexa in KEX_PUBKEYS:
+            kexa = _kexa
+            break
+
+    if not kexa:
+        no_kex.append(remote_addr)
+        remove(sock)
+
+    sock.sendall(pack(KEX_PUBKEYS[kexa]))
+
+def scan_hosts(
+        hosts, port, fingerprint, timeout=5,
+        portscan_only=False, hostkey_algorithm=None):
+
+    with PortScanner(hosts, port, hostkey_algorithm, timeout) as scanner:
+
+        def _test_for_open(socket, data):
+            if data:
+                scanner.mark_as_open(socket)
+            socket.destroy()
+
+        def _check_server_host_key(socket, data):
+
+            if not data:
+                socket.destroy()
+                return False
+
+            keep_socket, server_host_key = process_recv(
+                data, socket, hostkey_algorithm)
+
+            if server_host_key and fingerprint in server_host_key:
+                scanner.mark_as_open(socket)
+
+            if not keep_socket:
+                socket.destroy()
+
+        _data_handler = _check_server_host_key if not portscan_only \
+            else _test_for_open
+
+        while scanner.sockets:
+
+            ifds, _o, _e = select.select(scanner.sockets, [], [], 1)
+
+            for s in ifds:
+                try:
+                    data = s.recv(2048)
+                except socket.error:
+                    continue
+                else:
+                    _data_handler(s, data)
+
+            scanner.timeout()
+
+        return scanner.get_scan_results()
+
+def _parse_cli_args():
 
     try:
-        optlist, args = getopt.getopt(sys.argv[1:], 'hp:', ['help', 'port='])
-        if len(args) != 2:
+        optlist, cli_args = getopt.getopt(
+            sys.argv[1:], 'hep:k:',
+            ['help', 'exec-ks', 'port=', 'key-algo='])
+        ssh_port = 22
+        key_algo = SUPPORTED_KEY_ALGOS['ecdsa']
+        ssh_keyscan = False
+        for o, a in optlist:
+            if o in ['-h', '--help']:
+                _stderr(USAGE, exit=1)
+            if o in ['-p', '--port']:
+                ssh_port = int(a.strip())
+            if o in ['-k', '--key-algo']:
+                try:
+                    key_algo = SUPPORTED_KEY_ALGOS[a.strip()]
+                except KeyError:
+                    raise getopt.GetoptError(
+                        'Host key algorithm "{}" is not supported'.format(a))
+            if o in ['-e', '--exec-ks']:
+                ssh_keyscan = True
+        if len(cli_args) != 2:
             raise getopt.GetoptError('wrong number of arguments')
     except getopt.GetoptError as e:
-        sys.stderr.write(str(e) + '\n')
-        sys.stderr.write(usage + '\n')
+        _stderr(str(e), USAGE, exit=1)
+
+    key_fingerprint = cli_args[0].strip()
+    network_number = cli_args[1].strip()
+
+    return key_fingerprint, network_number, ssh_port, key_algo, ssh_keyscan
+
+def _start_scan(hosts_list):
+
+    batches_scanned = 0
+
+    _stdout('Scanning {} hosts in batches of {}. {} batches total.'.format(
+        len(hosts_list), SCAN_BATCH_SIZE \
+            if len(hosts_list) > SCAN_BATCH_SIZE else len(hosts_list),
+        int(math.ceil(len(hosts_list) / SCAN_BATCH_SIZE)) \
+            if len(hosts_list) > SCAN_BATCH_SIZE else 1))
+
+    while hosts_list:
+
+        _stdout(
+            'Scanning batch {}'.format(batches_scanned + 1),
+            overwrite=True)
+
+        scan_results = scan_hosts(
+            hosts_list[:SCAN_BATCH_SIZE],
+            int(SSH_PORT), FINGERPRINT_PARTIAL,
+            portscan_only=SSH_KEYSCAN,
+            hostkey_algorithm=KEY_EX_ALGORITHM)
+
+        if scan_results:
+            if not SSH_KEYSCAN:
+                _stdout('Found sshd at {}:{}'.format(
+                    scan_results[0], SSH_PORT))
+                sys.exit(0)
+            with tempfile.NamedTemporaryFile(delete=True) as tmpf:
+                tmpf.write('\n'.join(scan_results))
+                tmpf.flush()
+                ks_scan = scan_host_keys(
+                    tmpf.name, SSH_PORT, FINGERPRINT_PARTIAL)
+            if ks_scan:
+                _stdout('Found sshd at {}:{}'.format(ks_scan, SSH_PORT))
+                sys.exit(0)
+
+        batches_scanned += 1
+        del hosts_list[:SCAN_BATCH_SIZE]
+
+
+if __name__ == '__main__':
+
+    FINGERPRINT_PARTIAL, AS_NUMBER, SSH_PORT, \
+        KEY_EX_ALGORITHM, SSH_KEYSCAN = _parse_cli_args()
+
+    if SSH_KEYSCAN and not test_cmd('ssh-keyscan'):
+        _stdout('No ssh-keyscan in $PATH', True)
         sys.exit(1)
-    ssh_port = 22
-    for o, a in optlist:
-        if o in ['-h', '--help']:
-            sys.stderr.write(usage + '\n')
-            sys.exit(1)
-        if o in ['-p', '--port']:
-            ssh_port = a
-    key_fingerprint = args[0].strip()
-    network_number = args[1].strip()
 
-    UNBUFFER_CMDS = ['stdbuf -i0 -o0 -e0', 'gstdbuf -i0 -o0 -e0']
-
-    # Check for ssh-keyscan and whois
-    for cmd in ['ssh-keyscan', 'whois']:
-        if not test_cmd(cmd):
-            print('no "{}" in $PATH. Exiting.'.format(cmd))
-            sys.exit(1)
-
-    # Check whether any of the predefined unbuffer cmds
-    # are found in $PATH. Inform user.
-    unbuf_cmd = None
-    for cmd in UNBUFFER_CMDS:
-        if test_cmd(cmd):
-            unbuf_cmd = cmd
-    if unbuf_cmd:
-        print('Using "{}" to unbuffer subprocess stdout'.format(unbuf_cmd))
-    else:
-        print('No unbuffer cmd in $PATH. Subprocess stdout will be buffered')
-        unbuf_cmd = ''
-
-    # Get WHOIS data from radb.net and parse network segments
-    whois = sp.Popen(['whois', '-h', 'whois.radb.net',
-       '--', '-i origin ' + network_number],
-       stdout=sp.PIPE, stderr=sp.STDOUT,
-       universal_newlines=True)
-    whois_output = whois.communicate()[0]
-
-    if whois.returncode != 0:
-        print('Non-zero exit code for "whois". Exiting.')
-        sys.exit(1)
-
-    ranges = []
-    ip_list = []
-    for line in whois_output.split('\n'):
-        if re.match(r'^route:', line):
-            ranges.append(re.split(r'\s+', line)[-1])
-
-    tmpfile = tempfile.NamedTemporaryFile()
-
-    if len(ranges) > 0:
-        print('Found {} ranges for {}'.format(len(ranges), network_number))
-        for r in ranges:
-            ip_list += cidr_range(r)
-        for line in ip_list:
-            tmpfile.write(line + '\n')
-        tmpfile.flush()
-        print('Wrote {} IPs to scanfile'.format(len(ip_list)))
-    else:
-        print('No ranges.')
-
-    cmd = unbuf_cmd.split(' ') + \
-        'ssh-keyscan -f {} -p {} -T 5'.format(tmpfile.name, ssh_port).split(' ')
-
-    ret = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE,
-        universal_newlines=True)
-
-    for line in iter(ret.stdout.readline, ''):
-        print(line.strip()[:120])
-        if key_fingerprint in line:
-            print('FOUND', line.strip()[:120])
-            sys.exit(0)
-
-    sys.exit(1)
+    _start_scan(create_hosts_list(AS_NUMBER))
+    _stdout('No sshd at found', True)
+    sys.exit(2)
