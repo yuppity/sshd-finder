@@ -575,7 +575,7 @@ def _start_scan(hosts_list):
                 ks_scan = scan_host_keys(
                     tmpf.name, SSH_PORT, FINGERPRINT_PARTIAL)
             if ks_scan:
-                _stdout('Found sshd at {}:{}'.format(ks_scan, SSH_PORT))
+                _stdout('Found sshd at {}'.format(ks_scan))
                 sys.exit(0)
 
         batches_scanned += 1
