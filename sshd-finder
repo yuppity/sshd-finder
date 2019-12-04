@@ -346,9 +346,10 @@ def process_recv(data, rsocket, hostkey_algorithm):
 
     if data.startswith('SSH-'):
 
-        # Abort unless protoversion >= 2.0
         if not data.startswith('SSH-2'):
             return keep_socket, server_host_key
+
+        keep_socket = True
 
         # Send our identification string followed by key exchange init
         rsocket.sendall(IDENTITFICATION_STRING + '\r\n')
