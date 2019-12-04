@@ -398,8 +398,6 @@ def extract_addr_blocks(whois_response):
         re.finditer(r'^\s*route:\s+([0-9].*)\s*$', whois_response, re.M)]
 
 def whois(as_number):
-    with open('whois_response', 'rb') as f:
-        return f.read()
     response = ''
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
