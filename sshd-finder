@@ -16,6 +16,7 @@ import select
 import base64
 import resource
 import math
+import signal
 from collections import OrderedDict
 
 USAGE = '''usage: {f} [-e] [-p port] [-k key_algo] fingerprint as_number
@@ -587,9 +588,14 @@ if __name__ == '__main__':
     FINGERPRINT_PARTIAL, AS_NUMBER, SSH_PORT, \
         KEY_EX_ALGORITHM, SSH_KEYSCAN = _parse_cli_args()
 
+    # Catch SIGINT to avoid ugly stack traces on the CLI. We don't need
+    # to do any cleanup: most of the socket stuff happens in a context manager
+    # and the rest should leave at most a couple of FDs open, that the OS
+    # should eventually take care of.
+    signal.signal(signal.SIGINT, lambda s, f: _stderr(exit='Killed by user'))
+
     if SSH_KEYSCAN and not test_cmd('ssh-keyscan'):
-        _stdout('No ssh-keyscan in $PATH', True)
-        sys.exit(1)
+        _stderr('No ssh-keyscan in $PATH', exit=1)
 
     _start_scan(create_hosts_list(AS_NUMBER))
     _stdout('No sshd at found', True)
